@@ -4,9 +4,7 @@ import numpy as np
 
 class MyARIMA(object):
     # input : (batch_size, index(_quantity), (train_)length)
-    # output : (batch_size, index(_quantity), 2 * freq_length)
-                                                # first freq_length: my selection (Soft_max / (1/x) / ... )
-                                                # second freq_length: auto_arima
+    # output : (batch_size, index(_quantity), freq_length)
 
     def __init__(self):
         # 5 index(s)
