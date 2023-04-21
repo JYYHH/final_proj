@@ -10,16 +10,13 @@ import sys
 
 df = pd.read_csv("index_data.csv")
 df = df.apply(func = lambda x : x[1:] if x.dtype == object else np.exp(np.diff(np.log(x))) - 1)
-date, data = df.date, np.array(df[['CSI1000', 'CSI500', 'CYB', 'HS300', 'SH50']])
+date, data = df.date, np.array(df[['CSI1000', 'CSI500', 'CYB', 'HS300', 'SH50']]).astype(np.float64)
 
 a = trans(data)
-print(a.shape)
+print(a.shape, a.dtype)
 
-# model = MyARIMA()
-
-# BE = time()
-# model.fit(a[:, :, :-1]) # features
-# print(f'Used time : {time() - BE}')
-# print(model.ret, a[:, :, -1]) # labels
-
-# np.save('data/test.npy', model.ret)
+model = GlobalModel()
+# model.train(a[:32])
+model.train(a[:1000], model.gpu)
+# model.test(a[:1000], model.gpu)
+model.test(a[1000:], model.gpu)
