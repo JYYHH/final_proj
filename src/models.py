@@ -98,7 +98,7 @@ class NNModel(torch.nn.Module):
         super(NNModel, self).__init__()
         
         self.freq = freq
-        self.length = 91 # recently used dates
+        self.length = 121 # recently used dates
 
         self.lstm = nn.LSTM(
                             input_size = 5,
@@ -145,7 +145,7 @@ class GlobalModel(object):
         self.lr = 1e-4
         self.wd = 0.0
         self.batch_size = 4
-        self.epochs = 16
+        self.epochs = 100
         self.optimizer_type = "sgd"
 
     def get_model_params(self):
