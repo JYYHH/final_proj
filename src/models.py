@@ -99,7 +99,7 @@ class NNModel(torch.nn.Module):
         super(NNModel, self).__init__()
         
         self.freq = freq
-        self.length = 61 # recently used dates
+        self.length = 61 # recently used dates / 61
 
         self.lstm = nn.LSTM(
                             input_size = 5,
@@ -120,6 +120,8 @@ class NNModel(torch.nn.Module):
         # final_hidden_state -> (batch_size, hidden_size)
         output_lstm = nn.Tanh()(self.fc(final_hidden_state))
         # output_lstm -> (batch_size, 5)
+        # return output_lstm
+
         output_arima = nn.Tanh()(self.arima_fc(arima_data.reshape(arima_data.shape[0], -1)))
         # output_arima -> (batch_size, 5)
 
@@ -140,13 +142,15 @@ class GlobalModel(object):
 
         # models
         self.arima_model = MyARIMA()
-        self.nn_model = NNModel(len(self.arima_model.freq))        
+        self.nn_model = NNModel(len(self.arima_model.freq)) 
+        self.best_nn_model = NNModel(len(self.arima_model.freq))   
+        self.best_metric = 0   
 
         # hyper_parameters for NN training
-        self.lr = 1e-4
+        self.lr = 3 * 1e-5
         self.wd = 0.0
         self.batch_size = 4
-        self.epochs = 5
+        self.epochs = 8
         self.optimizer_type = "sgd"
 
     def get_model_params(self):
@@ -169,10 +173,11 @@ class GlobalModel(object):
             data[batch_idx] = (torch.tensor(x).to(device), torch.tensor(arima_x).to(device), torch.tensor(values).to(device))
             
 
-    def train(self, data, train_index, device = "cpu"):
+    def train(self, data, train_index, dev_index, device = "cpu"):
         self.nn_model.to_device(device)
+        self.best_nn_model.to_device(device)
         self.nn_model.train()
-        train_data = data[train_index]
+        train_data, dev_data = data[train_index], data[dev_index]
 
         # train and update
         criterion = nn.MSELoss().to(device)
@@ -195,10 +200,11 @@ class GlobalModel(object):
                         )
         
         # transform the data -------> now combine the output of ARIMA Models
-        self.train_len = train_data.shape[0]
         train_data = self.ret_batch_data(train_data, self.arima_model.get_ret_from_file(train_index))
+        dev_data = self.ret_batch_data(dev_data, self.arima_model.get_ret_from_file(dev_index))
         # move to device(GPU)
         self.preprocessing(train_data, device)
+        self.preprocessing(dev_data, device)
 
         begin_time = time.time()
 
@@ -218,12 +224,37 @@ class GlobalModel(object):
 
             epoch_loss.append(sum(batch_loss) / tot_sample)
             print('Epoch: {} \nAverage data point Loss(MSE): {:.6f}'.format(epoch, epoch_loss[-1]))
+
+            # use the dev-data-set to test the model in independent dataset
+            with torch.no_grad():
+                tot, right = 0, 0
+                for batch_idx, (x, arima_x, values) in enumerate(dev_data):
+                    # x, values = x.to(device), values.to(device)
+                    pred = self.nn_model(x, arima_x).reshape(-1)
+                    loss = criterion(pred, values.reshape(-1))
+
+                    # _, predicted = torch.max(pred, -1)
+                    tot += x.shape[0] * 5
+                    right += torch.sum((pred * values.reshape(-1)) > 0)
+
+                    if batch_idx <= 2:
+                        print(pred[:5], values.reshape(-1)[:5])
+                acc = right/tot
+                print('ACC in dev dataset: {:.6f}'.format(acc))
+
+                # only save the best model !
+                if acc > self.best_metric :
+                    self.best_metric = acc
+                    self.best_nn_model.load_state_dict(self.nn_model.state_dict())
         
         print(f'total time = {time.time() - begin_time} s')
 
     def test(self, data, test_index, device = "cpu"):
-        self.nn_model.to(device)
+        self.best_nn_model.to(device)
         self.nn_model.eval()
+
+        # print(self.best_nn_model.state_dict())
+
         test_data = data[test_index]
 
         metrics = {
@@ -242,7 +273,7 @@ class GlobalModel(object):
         with torch.no_grad():
             for batch_idx, (x, arima_x, values) in enumerate(test_data):
                 # x, values = x.to(device), values.to(device)
-                pred = self.nn_model(x, arima_x).reshape(-1)
+                pred = self.best_nn_model(x, arima_x).reshape(-1)
                 loss = criterion(pred, values.reshape(-1))
 
                 # _, predicted = torch.max(pred, -1)
