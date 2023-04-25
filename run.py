@@ -17,6 +17,6 @@ print(a.shape, a.dtype)
 
 model = GlobalModel()
 # model.train(a[:32])
-model.train(a[:1000], model.gpu)
+model.train(a, np.arange(1000), model.gpu)
 # model.test(a[:1000], model.gpu)
-model.test(a[1000:], model.gpu)
+model.test(a, np.arange(1000, a.shape[0]), model.gpu)

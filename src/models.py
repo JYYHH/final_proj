@@ -78,7 +78,7 @@ class MyARIMA(object):
     def get_ret(self):
         return self.ret
 
-    def get_ret_from_file(self, l, r):
+    def get_ret_from_file(self, subset):
         try:
             now_pos, now_ret = 1, np.load("arima_data/1.npy")
             while 1:
@@ -89,7 +89,8 @@ class MyARIMA(object):
                 except:
                     break
                 
-            return now_ret[l : r]
+            return now_ret[subset]
+        # (|subset|, index(_quantity), freq_length)
         except:
             return None
 
@@ -98,13 +99,13 @@ class NNModel(torch.nn.Module):
         super(NNModel, self).__init__()
         
         self.freq = freq
-        self.length = 121 # recently used dates
+        self.length = 61 # recently used dates
 
         self.lstm = nn.LSTM(
                             input_size = 5,
                             hidden_size = hidden_size, 
-                            num_layers=2, 
-                            batch_first=True
+                            num_layers = 3, 
+                            batch_first = True
                         ).double() # into float64
         self.fc = nn.Linear(hidden_size, 5).double()
         self.arima_fc = nn.Linear(freq * 5, 5).double()
@@ -145,7 +146,7 @@ class GlobalModel(object):
         self.lr = 1e-4
         self.wd = 0.0
         self.batch_size = 4
-        self.epochs = 100
+        self.epochs = 5
         self.optimizer_type = "sgd"
 
     def get_model_params(self):
@@ -155,9 +156,11 @@ class GlobalModel(object):
         self.nn_model.load_state_dict(model_parameters)
 
     def ret_batch_data(self, data, arimadata):
-        print(data.shape, arimadata.shape)
         data = data.transpose(0, 2, 1)
         arimadata = arimadata.transpose(0, 2, 1)
+        # print(data.shape, arimadata.shape)
+        # data (data_number, length, index_number)
+        # arimadata (data_number, freq, index_number)
         return [ (data[i : i + self.batch_size, : -1], arimadata[i : i + self.batch_size], data[i : i + self.batch_size, -1]) for i in range(0, data.shape[0], self.batch_size)]
 
     def preprocessing(self, data, device):
@@ -166,9 +169,10 @@ class GlobalModel(object):
             data[batch_idx] = (torch.tensor(x).to(device), torch.tensor(arima_x).to(device), torch.tensor(values).to(device))
             
 
-    def train(self, train_data, device = "cpu"):
+    def train(self, data, train_index, device = "cpu"):
         self.nn_model.to_device(device)
         self.nn_model.train()
+        train_data = data[train_index]
 
         # train and update
         criterion = nn.MSELoss().to(device)
@@ -192,9 +196,8 @@ class GlobalModel(object):
         
         # transform the data -------> now combine the output of ARIMA Models
         self.train_len = train_data.shape[0]
-        train_data = self.ret_batch_data(train_data, self.arima_model.get_ret_from_file(0, self.train_len))
-        # preprocessing   <----------> x : (batch_size, length-1, 5) -----> # x : (batch, freq, fit_length, 5)
-        # and move to device(GPU)
+        train_data = self.ret_batch_data(train_data, self.arima_model.get_ret_from_file(train_index))
+        # move to device(GPU)
         self.preprocessing(train_data, device)
 
         begin_time = time.time()
@@ -218,9 +221,10 @@ class GlobalModel(object):
         
         print(f'total time = {time.time() - begin_time} s')
 
-    def test(self, test_data, device = "cpu"):
+    def test(self, data, test_index, device = "cpu"):
         self.nn_model.to(device)
         self.nn_model.eval()
+        test_data = data[test_index]
 
         metrics = {
             'total_loss': 0.0,
@@ -231,7 +235,7 @@ class GlobalModel(object):
         criterion = nn.MSELoss().to(device)
 
         # transform the data
-        test_data = self.ret_batch_data(test_data, self.arima_model.get_ret_from_file(self.train_len, 6666))
+        test_data = self.ret_batch_data(test_data, self.arima_model.get_ret_from_file(test_index))
         # pre_move to GPU
         self.preprocessing(test_data, device)
 
