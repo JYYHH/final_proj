@@ -4,12 +4,14 @@ import numpy as np
 import torch.nn as nn
 import time
 
+Index_number = 1
+
 class MyARIMA(object):
     # input : (batch_size, index(_quantity), (train_length =) length - 1)
-    # output : (batch_size, index(_quantity), freq_length)
+    # output : (batch_size, index(_quantity), freq_length, oders_length)
 
     def __init__(self):
-        # 5 index(s)
+        # Index_number index(s)
         
         # hyper_parameters
         self.models = [
@@ -54,8 +56,9 @@ class MyARIMA(object):
                 predict_arr.append(model.predict(1))
             aic_arr, predict_arr = np.array(aic_arr), np.array(predict_arr)
             # print(aic_arr, predict_arr)
-            ret_my.append(np.float64(np.dot(predict_arr.reshape(-1), self.prob_func(aic_arr).reshape(-1))))
-
+            
+            # ret_my.append(np.float64(np.dot(predict_arr.reshape(-1), self.prob_func(aic_arr).reshape(-1)))) # no order dim version
+            ret_my.append(predict_arr)
             # ret_auto
             # model = auto_arima(sub_data, start_p=1, start_q=1, start_P=1, start_Q=1,
             #          max_p=5, max_q=5, max_P=5, max_Q=5, seasonal=True,
@@ -73,7 +76,7 @@ class MyARIMA(object):
         batch_size, index_len = data.shape[0], data.shape[1]
         # flatten to 2-D array
         self.ret = np.apply_along_axis(self.fit_sub, 1, data.reshape(-1, data.shape[2]))
-        self.ret = self.ret.reshape(batch_size, index_len, -1)
+        self.ret = self.ret.reshape(batch_size, index_len, len(self.freq), len(self.models))
 
     def get_ret(self):
         return self.ret
@@ -102,31 +105,32 @@ class NNModel(torch.nn.Module):
         self.length = 61 # recently used dates / 61
 
         self.lstm = nn.LSTM(
-                            input_size = 5,
+                            input_size = Index_number,
                             hidden_size = hidden_size, 
-                            num_layers = 3, 
+                            num_layers = 2, 
                             batch_first = True
                         ).double() # into float64
-        self.fc = nn.Linear(hidden_size, 5).double()
-        self.arima_fc = nn.Linear(freq * 5, 5).double()
-        self.final_fc = nn.Linear(10, 5).double()
+        self.fc = nn.Linear(hidden_size, Index_number).double()
+        self.arima_fc = nn.Linear(freq * Index_number, Index_number).double()
+        self.final_fc = nn.Linear(2 * Index_number, Index_number).double()
 
     def forward(self, input_seq, arima_data):
-        # input_seq -> (batch_size, length - 1, 5)
-        # arima_data -> (batch_size, freq, 5)
+        # input_seq -> (batch_size, length - 1, Index_number)
+        # arima_data -> (batch_size, freq, Index_number)
         lstm_out, _ = self.lstm(input_seq[:, -self.length:]) # only used recently 120 days data
         # lstm_out -> (batch_size, length - 1, hidden_size)
         final_hidden_state = lstm_out[:, -1]
         # final_hidden_state -> (batch_size, hidden_size)
-        output_lstm = nn.Tanh()(self.fc(final_hidden_state))
-        # output_lstm -> (batch_size, 5)
+        output_lstm = self.fc(final_hidden_state)
+        # output_lstm -> (batch_size, Index_number)
         # return output_lstm
 
-        output_arima = nn.Tanh()(self.arima_fc(arima_data.reshape(arima_data.shape[0], -1)))
-        # output_arima -> (batch_size, 5)
+        output_arima = self.arima_fc(arima_data.reshape(arima_data.shape[0], -1))
+        # output_arima -> (batch_size, Index_number)
+        # return output_arima
 
         output = self.final_fc(torch.cat((output_lstm, output_arima), 1))
-        # output -> (batch_size, 5)
+        # output -> (batch_size, Index_number)
         return output
 
     def to_device(self, device):
@@ -147,11 +151,11 @@ class GlobalModel(object):
         self.best_metric = 0   
 
         # hyper_parameters for NN training
-        self.lr = 3 * 1e-5
+        self.lr = 1 * 1e-3
         self.wd = 0.0
-        self.batch_size = 4
-        self.epochs = 8
-        self.optimizer_type = "sgd"
+        self.batch_size = 32
+        self.epochs = 12
+        self.optimizer_type = "adam"
 
     def get_model_params(self):
         return self.nn_model.cpu().state_dict()
@@ -165,7 +169,9 @@ class GlobalModel(object):
         # print(data.shape, arimadata.shape)
         # data (data_number, length, index_number)
         # arimadata (data_number, freq, index_number)
-        return [ (data[i : i + self.batch_size, : -1], arimadata[i : i + self.batch_size], data[i : i + self.batch_size, -1]) for i in range(0, data.shape[0], self.batch_size)]
+        permu = np.arange(data.shape[0])
+        np.random.shuffle(permu)
+        return [ (data[permu[i : i + self.batch_size], : -1], arimadata[permu[i : i + self.batch_size]], data[permu[i : i + self.batch_size], -1]) for i in range(0, data.shape[0], self.batch_size)]
 
     def preprocessing(self, data, device):
         # pre_move to GPU && some transforming
@@ -196,7 +202,8 @@ class GlobalModel(object):
                             filter(lambda p: p.requires_grad, self.nn_model.parameters()), 
                             lr = self.lr,
                             weight_decay = self.wd, 
-                            amsgrad=True
+                            amsgrad=True,
+                            betas = (0.9, 0.999)
                         )
         
         # transform the data -------> now combine the output of ARIMA Models
@@ -214,8 +221,8 @@ class GlobalModel(object):
             for batch_idx, (x, arima_x, values) in enumerate(train_data):
                 # x, values = x.to(device), values.to(device)
                 self.nn_model.zero_grad()
-                Pred = self.nn_model(x, arima_x).reshape(-1)
-                loss = criterion(Pred, values.reshape(-1)) * x.shape[0]
+                Pred = self.nn_model(x[:, :, :Index_number], arima_x[:, :, :Index_number]).reshape(-1)
+                loss = criterion(Pred, values.reshape(x.shape[0], -1)[:, :Index_number].reshape(-1)) * x.shape[0]
                 loss.backward()
 
                 optimizer.step()
@@ -230,24 +237,28 @@ class GlobalModel(object):
                 tot, right = 0, 0
                 for batch_idx, (x, arima_x, values) in enumerate(dev_data):
                     # x, values = x.to(device), values.to(device)
-                    pred = self.nn_model(x, arima_x).reshape(-1)
-                    loss = criterion(pred, values.reshape(-1))
+                    pred = self.nn_model(x[:, :, :Index_number], arima_x[:, :, :Index_number]).reshape(-1)
+                    loss = criterion(pred, values.reshape(x.shape[0], -1)[:, :Index_number].reshape(-1))
 
                     # _, predicted = torch.max(pred, -1)
-                    tot += x.shape[0] * 5
-                    right += torch.sum((pred * values.reshape(-1)) > 0)
+                    tot += x.shape[0] * Index_number
+                    right += torch.sum((pred * values.reshape(x.shape[0], -1)[:, :Index_number].reshape(-1)) > 0)
 
                     if batch_idx <= 2:
-                        print(pred[:5], values.reshape(-1)[:5])
+                        print(pred[:10], values.reshape(x.shape[0], -1)[:, :Index_number].reshape(-1)[:10], end = '\n')
                 acc = right/tot
                 print('ACC in dev dataset: {:.6f}'.format(acc))
 
                 # only save the best model !
-                if acc > self.best_metric :
+                if acc >= self.best_metric :
                     self.best_metric = acc
                     self.best_nn_model.load_state_dict(self.nn_model.state_dict())
         
         print(f'total time = {time.time() - begin_time} s')
+        print(f'Best acc in valid set : {self.best_metric}')
+
+        print(self.best_nn_model)
+        # print(self.best_nn_model.state_dict())
 
     def test(self, data, test_index, device = "cpu"):
         self.best_nn_model.to(device)
@@ -273,15 +284,15 @@ class GlobalModel(object):
         with torch.no_grad():
             for batch_idx, (x, arima_x, values) in enumerate(test_data):
                 # x, values = x.to(device), values.to(device)
-                pred = self.best_nn_model(x, arima_x).reshape(-1)
-                loss = criterion(pred, values.reshape(-1))
+                pred = self.nn_model(x[:, :, :Index_number], arima_x[:, :, :Index_number]).reshape(-1)
+                loss = criterion(pred, values.reshape(x.shape[0], -1)[:, :Index_number].reshape(-1))
 
                 # _, predicted = torch.max(pred, -1)
                 metrics['total_loss'] += loss.item() * x.shape[0]
-                metrics['test_total'] += x.shape[0]
-                metrics['right_number'] += torch.sum((pred * values.reshape(-1)) > 0)
+                metrics['test_total'] += x.shape[0] * Index_number
+                metrics['right_number'] += torch.sum((pred * values.reshape(x.shape[0], -1)[:, :Index_number].reshape(-1)) > 0)
 
-        print('ACC = {}'.format(metrics['right_number'] / (metrics['test_total'] * 5)))
+        print('ACC = {}'.format(metrics['right_number'] / metrics['test_total']))
 
         return metrics
 
