@@ -12,7 +12,7 @@ df = pd.read_csv("index_data.csv")
 df = df.apply(func = lambda x : x[1:] if x.dtype == object else np.diff(np.log(x)))
 date, data = df.date, np.array(df[['CSI1000', 'CSI500', 'CYB', 'HS300', 'SH50']]).astype(np.float64)
 
-a = trans(raw_data = data, length = 931, interval = 1, after = 30)
+a = trans(raw_data = data, length = 931, interval = 15, after = 30)
 print(a.shape, a.dtype)
 
 model = GlobalModel()

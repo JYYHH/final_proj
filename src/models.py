@@ -33,6 +33,7 @@ class MyARIMA(object):
             ARIMA(order = (2,2,2), method='lbfgs', suppress_warnings=True),
         ]
         self.fit_length = 30
+        self.onum = 16
 
         # output of this resemble model
         self.ret = None
@@ -91,10 +92,10 @@ class MyARIMA(object):
             return None
 
 class NNModel(torch.nn.Module):
-    def __init__(self, freq, hidden_size = 32):
+    def __init__(self, onum, hidden_size = 32):
         super(NNModel, self).__init__()
         
-        self.freq = freq
+        self.arima_len = onum
         self.length = 61 # recently used dates / 61
 
         self.lstm = nn.LSTM(
@@ -114,7 +115,7 @@ class NNModel(torch.nn.Module):
                     # nn.LeakyReLU(),
                     # nn.Linear(50, Index_number)
                  ).double()
-        self.arima_fc = nn.Linear(freq * Index_number, Index_number).double()
+        self.arima_fc = nn.Linear(self.arima_len * Index_number, Index_number).double()
         self.final_fc = nn.Linear(2 * Index_number, Index_number).double()
 
     def forward(self, input_seq, arima_data):
@@ -150,35 +151,40 @@ class GlobalModel(object):
         # models
         self.arima_model = MyARIMA()
         self.xgb = [
+            # 70 %
                     XGBRegressor(n_estimators = 2000, 
-                                learning_rate = 0.1, 
+                                learning_rate = 0.078588,  
                                 max_depth = 6, 
                                 early_stopping_rounds = 5
                             ),
+            # 66.7 %
                     XGBRegressor(n_estimators = 2000, 
-                                learning_rate = 0.1, 
+                                learning_rate = 0.005, 
                                 max_depth = 6, 
                                 early_stopping_rounds = 5
                             ),
+            #  71 % 
                     XGBRegressor(n_estimators = 2000, 
-                                learning_rate = 0.1, 
+                                learning_rate = 0.078588, 
                                 max_depth = 6, 
                                 early_stopping_rounds = 5
                             ),
+            # 53 %
                     XGBRegressor(n_estimators = 2000, 
-                                learning_rate = 0.1, 
-                                max_depth = 6, 
-                                early_stopping_rounds = 5
+                                learning_rate = 0.1028, 
+                                max_depth = 3, 
+                                early_stopping_rounds = 2
                             ),
+            # 55.3 %
                     XGBRegressor(n_estimators = 2000, 
-                                learning_rate = 0.1, 
-                                max_depth = 6, 
-                                early_stopping_rounds = 5
+                                learning_rate = 0.19972, 
+                                max_depth = 4, 
+                                early_stopping_rounds = 3
                             )
                    ]
         
-        self.nn_model = NNModel(len(self.arima_model.freq)) 
-        self.best_nn_model = NNModel(len(self.arima_model.freq))   
+        self.nn_model = NNModel(self.arima_model.onum) 
+        self.best_nn_model = NNModel(self.arima_model.onum)  
         self.best_metric = 0   
 
         # hyper_parameters for NN training
@@ -233,7 +239,8 @@ class GlobalModel(object):
         self.nn_model.train()
         train_data_raw, dev_data_raw = data[train_index], data[dev_index]
 
-        self.xgb_train(train_data_raw, dev_data_raw, 0)
+        self.xgb_train(train_data_raw, dev_data_raw, 4)
+        exit(0)
 
         # train and update
         criterion = nn.MSELoss().to(device) # Regression
