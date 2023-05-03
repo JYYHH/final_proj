@@ -3,6 +3,7 @@ import torch
 import numpy as np
 import torch.nn as nn
 import time
+from xgboost import XGBRegressor
 
 Index_number = 1
 
@@ -156,6 +157,12 @@ class GlobalModel(object):
 
         # models
         self.arima_model = MyARIMA()
+        self.xgb = XGBRegressor(n_estimators = 2000, 
+                                learning_rate = 0.05, 
+                                max_depth = 6, 
+                                early_stopping_rounds = 5
+                            )
+        
         self.nn_model = NNModel(len(self.arima_model.freq)) 
         self.best_nn_model = NNModel(len(self.arima_model.freq))   
         self.best_metric = 0   
@@ -164,7 +171,7 @@ class GlobalModel(object):
         self.lr = 3 * 1e-4
         self.wd = 0.0
         self.batch_size = 16
-        self.epochs = 10
+        self.epochs = 0
         self.optimizer_type = "adam"
 
     def get_model_params(self):
@@ -188,12 +195,30 @@ class GlobalModel(object):
         for batch_idx, (x, arima_x, values) in enumerate(data):
             data[batch_idx] = (torch.tensor(x).to(device), torch.tensor(arima_x).to(device), torch.tensor(values).to(device))
             
+    def xgb_train(self, train_data, dev_data, which_index):
+        train_data = train_data.transpose(0, 2, 1)
+        dev_data = dev_data.transpose(0, 2, 1)
+        self.xgb.fit(train_data[:, :-1, which_index], train_data[:, -1, which_index], 
+             eval_set = [(dev_data[:, :-1, which_index], dev_data[:, -1, which_index])], verbose=False)
+        predictions = self.xgb.predict(dev_data[:, :-1, which_index])
+        true_y = dev_data[:, -1, which_index]
+        acc = np.sum(predictions * true_y > 0) / predictions.shape[0]
+        print(f"XGBoost 's acc on dev_set = {acc}")
+        predictions = self.xgb.predict(train_data[:, :-1, which_index])
+        true_y = train_data[:, -1, which_index]
+        acc = np.sum(predictions * true_y > 0) / predictions.shape[0]
+        print(f"XGBoost 's acc on train_set = {acc}")
+        print(predictions[10:20])
+        print(true_y[10:20])
+
 
     def train(self, data, train_index, dev_index, device = "cpu"):
         self.nn_model.to_device(device)
         self.best_nn_model.to_device(device)
         self.nn_model.train()
         train_data_raw, dev_data_raw = data[train_index], data[dev_index]
+
+        self.xgb_train(train_data_raw, dev_data_raw, 4)
 
         # train and update
         # criterion = nn.MSELoss().to(device) # Regression

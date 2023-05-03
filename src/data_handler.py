@@ -14,7 +14,7 @@ def trans(raw_data, length = 931, interval = 1): # 931
     # mid_data (total_length, Index_number)
 
     Dim0 = raw_data.shape[0] - length + 1
-    # return np.array([np.vstack((raw_data[i : i + length - interval], np.sum(raw_data[i + length - interval : i + length], axis = 0, keepdims = True))) for i in range(Dim0)]).transpose(0, 2, 1) # 1 days interval and interval days prediction
+    # return np.array([np.vstack((raw_data[i : i + length - interval], np.sum(raw_data[i + length - interval : i + length], axis = 0, keepdims = True))) for i in range(Dim0)]).transpose(0, 2, 1) # 1 days interval and `interval` days prediction
     return np.array([ sum_up(raw_data[i : i + length], interval) for i in range(Dim0)]).transpose(0, 2, 1)
     # shape -> (data_length, index, length)
 
