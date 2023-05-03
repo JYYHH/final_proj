@@ -9,7 +9,7 @@ Index_number = 1
 
 class MyARIMA(object):
     # input : (batch_size, index(_quantity), (train_length =) length - 1)
-    # output : (batch_size, index(_quantity), freq_length, oders_length)
+    # output : (batch_size, index(_quantity), oders_length = 16)
 
     def __init__(self):
         # Index_number index(s)
@@ -18,66 +18,58 @@ class MyARIMA(object):
         self.models = [
             ARIMA(order = (1,1,0), method='lbfgs', suppress_warnings=True),
             ARIMA(order = (0,1,1), method='lbfgs', suppress_warnings=True),
+            ARIMA(order = (1,0,1), method='lbfgs', suppress_warnings=True),
             ARIMA(order = (1,1,1), method='lbfgs', suppress_warnings=True),
+            ARIMA(order = (2,1,0), method='lbfgs', suppress_warnings=True),
+            ARIMA(order = (2,0,1), method='lbfgs', suppress_warnings=True),
+            ARIMA(order = (0,1,2), method='lbfgs', suppress_warnings=True),
+            ARIMA(order = (0,2,1), method='lbfgs', suppress_warnings=True),
+            ARIMA(order = (1,0,2), method='lbfgs', suppress_warnings=True),
+            ARIMA(order = (1,2,0), method='lbfgs', suppress_warnings=True),
+            ARIMA(order = (1,2,1), method='lbfgs', suppress_warnings=True),
+            ARIMA(order = (1,1,2), method='lbfgs', suppress_warnings=True),
             ARIMA(order = (2,1,1), method='lbfgs', suppress_warnings=True),
-            ARIMA(order = (2,1,0), method='lbfgs', suppress_warnings=True)
+            ARIMA(order = (2,2,1), method='lbfgs', suppress_warnings=True),
+            ARIMA(order = (2,2,2), method='lbfgs', suppress_warnings=True),
         ]
         self.fit_length = 30
-        self.freq = [1, 2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31]
 
         # output of this resemble model
         self.ret = None
         
         self.cnt = 0
-    
-    # hyper_param
-    def prob_func(self, Y):
-        # soft_max
-        # mid = np.exp(Y.min() - Y)
-        # return mid / mid.sum()
-
-        # 1/x
-        mid = 1.0 / (Y - Y.min() + 1)
-        return mid / mid.sum()
 
 
     def fit_sub(self, data): # data -> 1-D time series
-        ret_my, ret_auto = [], []
+        # get the correspond data for this frequent
+        sub_data = data[-1::-1][:self.fit_length][-1::-1]
 
-        for f in self.freq:
-            print(f'Now freq = {f}')
-            # get the correspond data for this frequent
-            sub_data = data[-f::-f][:self.fit_length][-1::-1]
+        # ret_my
+        aic_arr, predict_arr = [], [] # aic && prediction array
+        for model in self.models:
+            model.fit(sub_data)
+            aic_arr.append(model.aic())
+            predict_arr.append(model.predict(1))
 
-            # ret_my
-            aic_arr, predict_arr = [], [] # aic && prediction array
-            for model in self.models:
-                model.fit(sub_data)
-                aic_arr.append(model.aic())
-                predict_arr.append(model.predict(1))
-            aic_arr, predict_arr = np.array(aic_arr), np.array(predict_arr)
-            # print(aic_arr, predict_arr)
-            
-            # ret_my.append(np.float64(np.dot(predict_arr.reshape(-1), self.prob_func(aic_arr).reshape(-1)))) # no order dim version
-            ret_my.append(predict_arr)
-            # ret_auto
-            # model = auto_arima(sub_data, start_p=1, start_q=1, start_P=1, start_Q=1,
-            #          max_p=5, max_q=5, max_P=5, max_Q=5, seasonal=True,
-            #          stepwise=True, suppress_warnings=True, D=10, max_D=10,
-            #          error_action='ignore')
-            # ret_auto.append(np.float64(model.predict(1)))
+        # ret_auto
+        model = auto_arima(sub_data, start_p=1, start_q=1, start_P=1, start_Q=1,
+                 max_p=5, max_q=5, max_P=5, max_Q=5, seasonal=True,
+                 stepwise=True, suppress_warnings=True, D=10, max_D=10,
+                 error_action='ignore')
+        predict_arr.append(model.predict(1))
 
         self.cnt += 1
         print(f"OK for data : {self.cnt}")
 
-        return np.array(ret_my + ret_auto)
+        aic_arr, predict_arr = np.array(aic_arr), np.array(predict_arr)
+        return predict_arr
 
 
     def fit(self, data):
         batch_size, index_len = data.shape[0], data.shape[1]
         # flatten to 2-D array
         self.ret = np.apply_along_axis(self.fit_sub, 1, data.reshape(-1, data.shape[2]))
-        self.ret = self.ret.reshape(batch_size, index_len, len(self.freq), len(self.models))
+        self.ret = self.ret.reshape(batch_size, index_len, len(self.models) + 1)
 
     def get_ret(self):
         return self.ret
@@ -114,7 +106,7 @@ class NNModel(torch.nn.Module):
                  
         self.fc = nn.Sequential(
                     nn.Linear(hidden_size, 1),
-                    nn.Sigmoid() # 做分类预测，1升/0降
+                    # nn.Sigmoid() # 做分类预测，1升/0降
                     # nn.LeakyReLU(),
                     # nn.Linear(200, 100),
                     # nn.LeakyReLU(),
@@ -157,11 +149,33 @@ class GlobalModel(object):
 
         # models
         self.arima_model = MyARIMA()
-        self.xgb = XGBRegressor(n_estimators = 2000, 
-                                learning_rate = 0.05, 
+        self.xgb = [
+                    XGBRegressor(n_estimators = 2000, 
+                                learning_rate = 0.1, 
+                                max_depth = 6, 
+                                early_stopping_rounds = 5
+                            ),
+                    XGBRegressor(n_estimators = 2000, 
+                                learning_rate = 0.1, 
+                                max_depth = 6, 
+                                early_stopping_rounds = 5
+                            ),
+                    XGBRegressor(n_estimators = 2000, 
+                                learning_rate = 0.1, 
+                                max_depth = 6, 
+                                early_stopping_rounds = 5
+                            ),
+                    XGBRegressor(n_estimators = 2000, 
+                                learning_rate = 0.1, 
+                                max_depth = 6, 
+                                early_stopping_rounds = 5
+                            ),
+                    XGBRegressor(n_estimators = 2000, 
+                                learning_rate = 0.1, 
                                 max_depth = 6, 
                                 early_stopping_rounds = 5
                             )
+                   ]
         
         self.nn_model = NNModel(len(self.arima_model.freq)) 
         self.best_nn_model = NNModel(len(self.arima_model.freq))   
@@ -196,15 +210,16 @@ class GlobalModel(object):
             data[batch_idx] = (torch.tensor(x).to(device), torch.tensor(arima_x).to(device), torch.tensor(values).to(device))
             
     def xgb_train(self, train_data, dev_data, which_index):
+        now_xgb = self.xgb[which_index]
         train_data = train_data.transpose(0, 2, 1)
         dev_data = dev_data.transpose(0, 2, 1)
-        self.xgb.fit(train_data[:, :-1, which_index], train_data[:, -1, which_index], 
+        now_xgb.fit(train_data[:, :-1, which_index], train_data[:, -1, which_index], 
              eval_set = [(dev_data[:, :-1, which_index], dev_data[:, -1, which_index])], verbose=False)
-        predictions = self.xgb.predict(dev_data[:, :-1, which_index])
+        predictions = now_xgb.predict(dev_data[:, :-1, which_index])
         true_y = dev_data[:, -1, which_index]
         acc = np.sum(predictions * true_y > 0) / predictions.shape[0]
         print(f"XGBoost 's acc on dev_set = {acc}")
-        predictions = self.xgb.predict(train_data[:, :-1, which_index])
+        predictions = now_xgb.predict(train_data[:, :-1, which_index])
         true_y = train_data[:, -1, which_index]
         acc = np.sum(predictions * true_y > 0) / predictions.shape[0]
         print(f"XGBoost 's acc on train_set = {acc}")
@@ -218,11 +233,11 @@ class GlobalModel(object):
         self.nn_model.train()
         train_data_raw, dev_data_raw = data[train_index], data[dev_index]
 
-        self.xgb_train(train_data_raw, dev_data_raw, 4)
+        self.xgb_train(train_data_raw, dev_data_raw, 0)
 
         # train and update
-        # criterion = nn.MSELoss().to(device) # Regression
-        criterion = nn.BCELoss().to(device) # Classification
+        criterion = nn.MSELoss().to(device) # Regression
+        # criterion = nn.BCELoss().to(device) # Classification
 
         if self.optimizer_type == "sgd":
             optimizer = torch.optim.SGD(
@@ -258,7 +273,7 @@ class GlobalModel(object):
                 # x, values = x.to(device), values.to(device)
                 self.nn_model.zero_grad()
                 Pred = self.nn_model(x[:, :, :Index_number], arima_x[:, :, :Index_number]).reshape(-1)
-                loss = criterion(Pred, (values.reshape(x.shape[0], -1)[:, :Index_number].reshape(-1) > 0).double()) * x.shape[0]
+                loss = criterion(Pred, values.reshape(x.shape[0], -1)[:, :Index_number].reshape(-1)) * x.shape[0]
                 loss.backward()
 
                 optimizer.step()
@@ -274,7 +289,7 @@ class GlobalModel(object):
                 for batch_idx, (x, arima_x, values) in enumerate(dev_data):
                     # x, values = x.to(device), values.to(device)
                     pred = self.nn_model(x[:, :, :Index_number], arima_x[:, :, :Index_number]).reshape(-1)
-                    loss = criterion(pred, (values.reshape(x.shape[0], -1)[:, :Index_number].reshape(-1) > 0).double()) * x.shape[0]
+                    loss = criterion(pred, values.reshape(x.shape[0], -1)[:, :Index_number].reshape(-1)) * x.shape[0]
 
                     # _, predicted = torch.max(pred, -1)
                     tot += x.shape[0] * Index_number
@@ -311,8 +326,8 @@ class GlobalModel(object):
             'test_total': 0
         }
 
-        # criterion = nn.MSELoss().to(device) # Regression
-        criterion = nn.BCELoss().to(device) # Classification
+        criterion = nn.MSELoss().to(device) # Regression
+        # criterion = nn.BCELoss().to(device) # Classification
         # transform the data
         test_data = self.ret_batch_data(test_data, self.arima_model.get_ret_from_file(test_index))
         # pre_move to GPU
@@ -323,7 +338,7 @@ class GlobalModel(object):
             for batch_idx, (x, arima_x, values) in enumerate(test_data):
                 # NNN = arima_x
                 pred = self.best_nn_model(x[:, :, :Index_number], arima_x[:, :, :Index_number]).reshape(-1)
-                loss = criterion(pred, (values.reshape(x.shape[0], -1)[:, :Index_number].reshape(-1) > 0).double()) * x.shape[0]
+                loss = criterion(pred, values.reshape(x.shape[0], -1)[:, :Index_number].reshape(-1)) * x.shape[0]
 
                 metrics['total_loss'] += loss.item() * x.shape[0]
                 metrics['test_total'] += x.shape[0] * Index_number

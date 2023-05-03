@@ -12,7 +12,7 @@ df = pd.read_csv("index_data.csv")
 df = df.apply(func = lambda x : x[1:] if x.dtype == object else np.diff(np.log(x)))
 date, data = df.date, np.array(df[['CSI1000', 'CSI500', 'CYB', 'HS300', 'SH50']]).astype(np.float64)
 
-a = trans(data, 931, 10)
+a = trans(raw_data = data, length = 931, interval = 1, after = 30)
 print(a.shape, a.dtype)
 
 model = GlobalModel()
@@ -21,4 +21,5 @@ model.train(a, np.arange(1000), np.arange(1000, 1300), model.gpu)
 # model.test(a[:1000], model.gpu)
 model.test(a, np.arange(1200, a.shape[0]), model.gpu)
 model.test(a, np.arange(1000), model.gpu)
+model.test(a, np.arange(1000, 1300), model.gpu)
 
