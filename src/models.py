@@ -110,7 +110,17 @@ class NNModel(torch.nn.Module):
                             num_layers = 2, 
                             batch_first = True
                         ).double() # into float64
-        self.fc = nn.Linear(hidden_size, Index_number).double()
+                 
+        self.fc = nn.Sequential(
+                    nn.Linear(hidden_size, 1),
+                    nn.Sigmoid() # 做分类预测，1升/0降
+                    # nn.LeakyReLU(),
+                    # nn.Linear(200, 100),
+                    # nn.LeakyReLU(),
+                    # nn.Linear(100, 50),
+                    # nn.LeakyReLU(),
+                    # nn.Linear(50, Index_number)
+                 ).double()
         self.arima_fc = nn.Linear(freq * Index_number, Index_number).double()
         self.final_fc = nn.Linear(2 * Index_number, Index_number).double()
 
@@ -123,7 +133,7 @@ class NNModel(torch.nn.Module):
         # final_hidden_state -> (batch_size, hidden_size)
         output_lstm = self.fc(final_hidden_state)
         # output_lstm -> (batch_size, Index_number)
-        # return output_lstm
+        return output_lstm
 
         output_arima = self.arima_fc(arima_data.reshape(arima_data.shape[0], -1))
         # output_arima -> (batch_size, Index_number)
@@ -151,10 +161,10 @@ class GlobalModel(object):
         self.best_metric = 0   
 
         # hyper_parameters for NN training
-        self.lr = 1 * 1e-3
+        self.lr = 3 * 1e-4
         self.wd = 0.0
-        self.batch_size = 32
-        self.epochs = 12
+        self.batch_size = 16
+        self.epochs = 10
         self.optimizer_type = "adam"
 
     def get_model_params(self):
@@ -183,10 +193,11 @@ class GlobalModel(object):
         self.nn_model.to_device(device)
         self.best_nn_model.to_device(device)
         self.nn_model.train()
-        train_data, dev_data = data[train_index], data[dev_index]
+        train_data_raw, dev_data_raw = data[train_index], data[dev_index]
 
         # train and update
-        criterion = nn.MSELoss().to(device)
+        # criterion = nn.MSELoss().to(device) # Regression
+        criterion = nn.BCELoss().to(device) # Classification
 
         if self.optimizer_type == "sgd":
             optimizer = torch.optim.SGD(
@@ -205,24 +216,24 @@ class GlobalModel(object):
                             amsgrad=True,
                             betas = (0.9, 0.999)
                         )
-        
-        # transform the data -------> now combine the output of ARIMA Models
-        train_data = self.ret_batch_data(train_data, self.arima_model.get_ret_from_file(train_index))
-        dev_data = self.ret_batch_data(dev_data, self.arima_model.get_ret_from_file(dev_index))
-        # move to device(GPU)
-        self.preprocessing(train_data, device)
-        self.preprocessing(dev_data, device)
 
         begin_time = time.time()
 
         epoch_loss = []
         for epoch in range(self.epochs):
+            # transform the data -------> now combine the output of ARIMA Models
+            train_data = self.ret_batch_data(train_data_raw, self.arima_model.get_ret_from_file(train_index))
+            dev_data = self.ret_batch_data(dev_data_raw, self.arima_model.get_ret_from_file(dev_index))
+            # move to device(GPU)
+            self.preprocessing(train_data, device)
+            self.preprocessing(dev_data, device)
+            
             batch_loss, tot_sample = [], 0
             for batch_idx, (x, arima_x, values) in enumerate(train_data):
                 # x, values = x.to(device), values.to(device)
                 self.nn_model.zero_grad()
                 Pred = self.nn_model(x[:, :, :Index_number], arima_x[:, :, :Index_number]).reshape(-1)
-                loss = criterion(Pred, values.reshape(x.shape[0], -1)[:, :Index_number].reshape(-1)) * x.shape[0]
+                loss = criterion(Pred, (values.reshape(x.shape[0], -1)[:, :Index_number].reshape(-1) > 0).double()) * x.shape[0]
                 loss.backward()
 
                 optimizer.step()
@@ -238,14 +249,15 @@ class GlobalModel(object):
                 for batch_idx, (x, arima_x, values) in enumerate(dev_data):
                     # x, values = x.to(device), values.to(device)
                     pred = self.nn_model(x[:, :, :Index_number], arima_x[:, :, :Index_number]).reshape(-1)
-                    loss = criterion(pred, values.reshape(x.shape[0], -1)[:, :Index_number].reshape(-1))
+                    loss = criterion(pred, (values.reshape(x.shape[0], -1)[:, :Index_number].reshape(-1) > 0).double()) * x.shape[0]
 
                     # _, predicted = torch.max(pred, -1)
                     tot += x.shape[0] * Index_number
                     right += torch.sum((pred * values.reshape(x.shape[0], -1)[:, :Index_number].reshape(-1)) > 0)
 
                     if batch_idx <= 2:
-                        print(pred[:10], values.reshape(x.shape[0], -1)[:, :Index_number].reshape(-1)[:10], end = '\n')
+                        # print(x[:3, :, :Index_number].reshape(3, -1))
+                        print(pred[:3], values.reshape(x.shape[0], -1)[:, :Index_number].reshape(-1)[:3], end = '\n')
                 acc = right/tot
                 print('ACC in dev dataset: {:.6f}'.format(acc))
 
@@ -262,7 +274,7 @@ class GlobalModel(object):
 
     def test(self, data, test_index, device = "cpu"):
         self.best_nn_model.to(device)
-        self.nn_model.eval()
+        self.best_nn_model.eval()
 
         # print(self.best_nn_model.state_dict())
 
@@ -274,25 +286,33 @@ class GlobalModel(object):
             'test_total': 0
         }
 
-        criterion = nn.MSELoss().to(device)
-
+        # criterion = nn.MSELoss().to(device) # Regression
+        criterion = nn.BCELoss().to(device) # Classification
         # transform the data
         test_data = self.ret_batch_data(test_data, self.arima_model.get_ret_from_file(test_index))
         # pre_move to GPU
         self.preprocessing(test_data, device)
 
+        # NNN = None
         with torch.no_grad():
             for batch_idx, (x, arima_x, values) in enumerate(test_data):
-                # x, values = x.to(device), values.to(device)
-                pred = self.nn_model(x[:, :, :Index_number], arima_x[:, :, :Index_number]).reshape(-1)
-                loss = criterion(pred, values.reshape(x.shape[0], -1)[:, :Index_number].reshape(-1))
+                # NNN = arima_x
+                pred = self.best_nn_model(x[:, :, :Index_number], arima_x[:, :, :Index_number]).reshape(-1)
+                loss = criterion(pred, (values.reshape(x.shape[0], -1)[:, :Index_number].reshape(-1) > 0).double()) * x.shape[0]
 
-                # _, predicted = torch.max(pred, -1)
                 metrics['total_loss'] += loss.item() * x.shape[0]
                 metrics['test_total'] += x.shape[0] * Index_number
                 metrics['right_number'] += torch.sum((pred * values.reshape(x.shape[0], -1)[:, :Index_number].reshape(-1)) > 0)
 
         print('ACC = {}'.format(metrics['right_number'] / metrics['test_total']))
+
+        # x = torch.normal(0, 1, (3, 61, 1)).to(self.gpu).double()
+        # print(x[0], x[1], x[2])
+        # print(self.best_nn_model(x[:1], NNN))
+        # print(self.best_nn_model(x[1:2], NNN))
+        # print(self.best_nn_model(x[2:3], NNN))
+        # print(self.best_nn_model(test_data[0][0][:, :, :Index_number], test_data[0][1][:, :, :Index_number]))
+        # print(self.best_nn_model(test_data[1][0][:, :, :Index_number], test_data[1][1][:, :, :Index_number]))
 
         return metrics
 
