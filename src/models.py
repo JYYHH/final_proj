@@ -163,7 +163,7 @@ class NNModel(torch.nn.Module):
         super(NNModel, self).__init__()
         
         self.arima_len = onum
-        self.length = 60 # recently used dates / 61
+        self.length = 60 # recently used dates / 60
         self.tcn = TemporalConvNet(5, [5, 5]).double()
 
         self.fc_between_tcn_lstm = nn.Linear(901, self.length).double()
@@ -192,10 +192,15 @@ class NNModel(torch.nn.Module):
                     # nn.LeakyReLU(),
                     # nn.Linear(50, Index_number)
                  ).double()
-        self.arima_fc = nn.Linear(self.arima_len * Index_number, Index_number).double()
-        self.final_fc = nn.Linear(2 * Index_number, Index_number).double()
 
-    def forward(self, input_seq, arima_data):
+        self.arima_fc = nn.Sequential(
+            nn.Linear(self.arima_len * Index_number, self.arima_len * Index_number),
+            nn.Tanh(),
+            nn.Linear(self.arima_len * Index_number, Index_number),
+        ).double()
+        self.final_fc = nn.Linear(3 * Index_number, Index_number).double()
+
+    def forward(self, input_seq, arima_data, xgboost_pred):
         # input_seq -> (batch_size, length - 1 = 901, Index_number)
         # arima_data -> (batch_size, orn, Index_number)
         tcn_out = self.tcn(torch.permute(input_seq, (0, 2, 1)))
@@ -207,15 +212,15 @@ class NNModel(torch.nn.Module):
         # lstm_out -> (batch_size, length - 1, hidden_size)
         final_hidden_state = lstm_out[:, -1]
         # final_hidden_state -> (batch_size, hidden_size)
-        output_lstm = nn.Tanh()(self.fc(final_hidden_state))
+        output_lstm = nn.ReLU()(self.fc(final_hidden_state))
         # output_lstm -> (batch_size, Index_number)
-        return output_lstm
+        # return output_lstm
 
-        output_arima = nn.Tanh()(self.arima_fc(arima_data.reshape(arima_data.shape[0], -1)))
+        output_arima = self.arima_fc(arima_data.reshape(arima_data.shape[0], -1))
         # output_arima -> (batch_size, Index_number)
         # return output_arima
 
-        output = self.final_fc(torch.cat((output_lstm, output_arima), 1))
+        output = self.final_fc(torch.cat((output_lstm, output_arima, xgboost_pred), 1))
         # output -> (batch_size, Index_number)
         return output
 
@@ -290,20 +295,19 @@ class GlobalModel(object):
         # arimadata (data_number, order_number, index_number)
         permu = np.arange(data.shape[0])
         np.random.shuffle(permu)
-        return [ (data[permu[i : i + self.batch_size], : -1], arimadata[permu[i : i + self.batch_size]], data[permu[i : i + self.batch_size], -1]) for i in range(0, data.shape[0], self.batch_size)]
+        return [ (permu[i : i + self.batch_size], data[permu[i : i + self.batch_size], : -1], arimadata[permu[i : i + self.batch_size]], data[permu[i : i + self.batch_size], -1]) for i in range(0, data.shape[0], self.batch_size)]
 
     def preprocessing(self, data, device):
         # pre_move to GPU && some transforming
-        for batch_idx, (x, arima_x, values) in enumerate(data):
-            data[batch_idx] = (torch.tensor(x).to(device), torch.tensor(arima_x).to(device), torch.tensor(values).to(device))
+        for batch_idx, (sel, x, arima_x, values) in enumerate(data):
+            data[batch_idx] = (torch.tensor(sel).to(device), torch.tensor(x).to(device), torch.tensor(arima_x).to(device), torch.tensor(values).to(device))
         Index_set.to(device)
 
     def xgb_train(self, train_data, dev_data):
+        train_data = train_data.transpose(0, 2, 1)
+        dev_data = dev_data.transpose(0, 2, 1)
         for which_index in range(5):
             now_xgb = self.xgb[which_index]
-            train_data = train_data.transpose(0, 2, 1)
-            dev_data = dev_data.transpose(0, 2, 1)
-
             now_xgb.fit(train_data[:, :-1, which_index], train_data[:, -1, which_index], 
                 eval_set = [(dev_data[:, :-1, which_index], dev_data[:, -1, which_index])], verbose=False)
             
@@ -321,6 +325,32 @@ class GlobalModel(object):
             # print(predictions[10:20])
             # print(true_y[10:20])
 
+    def xgb_test(self, test_data):
+        right, tot = 0, 0
+        test_data = test_data.transpose(0, 2, 1)
+        for which_index in Index_set:
+            now_xgb = self.xgb[which_index]
+            predictions = now_xgb.predict(test_data[:, :-1, which_index])
+            true_y = test_data[:, -1, which_index]
+            tot += predictions.shape[0]
+            # print(predictions[30:50], true_y[30:50])
+            right += np.sum(predictions * true_y > 0)
+        
+        print(f"XGB test : Acc on test data is {right / tot}")
+
+    def xgb_predict(self, infer_data):
+        # data -> (batch_size, Index_number, length)
+        ret = []
+        for idx, which_index in enumerate(Index_set):
+            now_xgb = self.xgb[which_index]
+            now_data = infer_data[:, idx]
+            # print(now_data.shape)
+            predictions = now_xgb.predict(now_data)
+            ret.append(predictions)
+        # ret -> (batch_size, Index_number)
+        ret = np.array(ret, dtype = np.float64).T
+        ret = torch.tensor(ret).to(self.gpu)
+        return ret
 
     def train(self, data, xgb_data, train_index, dev_index, device = "cpu"):
         self.nn_model.to_device(device)
@@ -328,7 +358,9 @@ class GlobalModel(object):
         self.nn_model.train()
         train_data_raw, dev_data_raw = data[train_index], data[dev_index]
 
-        # self.xgb_train(train_data_raw, dev_data_raw)
+        self.xgb_train(xgb_data[train_index], xgb_data[dev_index])
+        # self.xgb_test(xgb_data[dev_index])
+        # exit(0)
 
         # train and update
         criterion = nn.MSELoss().to(device) # Regression
@@ -364,10 +396,16 @@ class GlobalModel(object):
             self.preprocessing(dev_data, device)
             
             batch_loss, tot_sample = [], 0
-            for batch_idx, (x, arima_x, values) in enumerate(train_data):
+            for batch_idx, (sel, x, arima_x, values) in enumerate(train_data):
                 # x, values = x.to(device), values.to(device)
                 self.nn_model.zero_grad()
-                Pred = self.nn_model(x[:, :, Index_set], arima_x[:, :, Index_set]).reshape(-1)
+                Pred = self.nn_model(
+                    x[:, :, Index_set], 
+                    arima_x[:, :, Index_set], 
+                    self.xgb_predict(
+                        xgb_data[train_index][sel.cpu().numpy()][:, Index_set, :-1]
+                    )
+                ).reshape(-1)
                 # print(Pred.shape, values.reshape(x.shape[0], -1)[:, Index_set].reshape(-1).shape)
                 loss = criterion(Pred, values.reshape(x.shape[0], -1)[:, Index_set].reshape(-1)) * x.shape[0]
                 loss.backward()
@@ -382,9 +420,15 @@ class GlobalModel(object):
             # use the dev-data-set to test the model in independent dataset
             with torch.no_grad():
                 tot, right = 0, 0
-                for batch_idx, (x, arima_x, values) in enumerate(dev_data):
+                for batch_idx, (sel, x, arima_x, values) in enumerate(dev_data):
                     # x, values = x.to(device), values.to(device)
-                    pred = self.nn_model(x[:, :, Index_set], arima_x[:, :, Index_set]).reshape(-1)
+                    pred = self.nn_model(
+                        x[:, :, Index_set], 
+                        arima_x[:, :, Index_set], 
+                        self.xgb_predict(
+                            xgb_data[dev_index][sel.cpu().numpy()][:, Index_set, :-1]
+                        )
+                    ).reshape(-1)
                     loss = criterion(pred, values.reshape(x.shape[0], -1)[:, Index_set].reshape(-1)) * x.shape[0]
 
                     # _, predicted = torch.max(pred, -1)
@@ -431,9 +475,16 @@ class GlobalModel(object):
 
         # NNN = None
         with torch.no_grad():
-            for batch_idx, (x, arima_x, values) in enumerate(test_data):
+            for batch_idx, (sel, x, arima_x, values) in enumerate(test_data):
                 # NNN = arima_x
-                pred = self.best_nn_model(x[:, :, Index_set], arima_x[:, :, Index_set]).reshape(-1)
+                pred = self.nn_model(
+                    x[:, :, Index_set], 
+                    arima_x[:, :, Index_set], 
+                    self.xgb_predict(
+                        xgb_data[test_index][sel.cpu().numpy()][:, Index_set, :-1]
+                    )
+                ).reshape(-1)
+                # print(pred.shape, values.reshape(x.shape[0], -1)[:, Index_set].reshape(-1).shape)
                 loss = criterion(pred, values.reshape(x.shape[0], -1)[:, Index_set].reshape(-1)) * x.shape[0]
 
                 metrics['total_loss'] += loss.item() * x.shape[0]

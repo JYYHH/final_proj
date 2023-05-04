@@ -20,7 +20,7 @@ model = GlobalModel()
 # model.train(a[:32])
 model.train(ALL, part, np.arange(1000), np.arange(1000, 1300), model.gpu)
 # model.test(a[:1000], model.gpu)
-model.test(ALL, part, np.arange(1200, a.shape[0]), model.gpu)
+model.test(ALL, part, np.arange(1200, ALL.shape[0]), model.gpu)
 model.test(ALL, part, np.arange(1000), model.gpu)
 model.test(ALL, part, np.arange(1000, 1300), model.gpu)
 
