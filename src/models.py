@@ -4,6 +4,8 @@ import numpy as np
 import torch.nn as nn
 import time
 from xgboost import XGBRegressor
+from torch.nn.utils import weight_norm
+import torch.nn.functional as F
 
 Index_set = torch.tensor([0, 1, 2, 3, 4])
 Index_number = Index_set.shape[0]
@@ -92,12 +94,79 @@ class MyARIMA(object):
         except:
             return None
 
+class Chomp1d(nn.Module):
+    def __init__(self, chomp_size):
+        super(Chomp1d, self).__init__()
+        self.chomp_size = chomp_size
+ 
+    def forward(self, x):
+        return x[:, :, :-self.chomp_size].contiguous()
+
+class TemporalBlock(nn.Module):
+    def __init__(self, n_inputs, n_outputs, kernel_size, stride, dilation, padding, dropout=0.2):
+        super(TemporalBlock, self).__init__()
+
+        self.conv1 = weight_norm(nn.Conv1d(n_inputs, n_outputs, kernel_size,
+                                           stride=stride, padding=padding, dilation=dilation))
+
+        self.chomp1 = Chomp1d(padding)
+        self.relu1 = nn.ReLU()
+        self.dropout1 = nn.Dropout(dropout)
+ 
+        self.conv2 = weight_norm(nn.Conv1d(n_outputs, n_outputs, kernel_size,
+                                           stride=stride, padding=padding, dilation=dilation))
+        self.chomp2 = Chomp1d(padding)
+        self.relu2 = nn.ReLU()
+        self.dropout2 = nn.Dropout(dropout)
+ 
+        self.net = nn.Sequential(self.conv1, self.chomp1, self.relu1, self.dropout1,
+                                 self.conv2, self.chomp2, self.relu2, self.dropout2)
+ 
+        self.downsample = nn.Conv1d(n_inputs, n_outputs, 1) if n_inputs != n_outputs else None
+
+        self.relu = nn.ReLU()
+        self.init_weights()
+ 
+    def init_weights(self):
+        self.conv1.weight.data.normal_(0, 0.01)
+        self.conv2.weight.data.normal_(0, 0.01)
+        if self.downsample is not None:
+            self.downsample.weight.data.normal_(0, 0.01)
+ 
+    def forward(self, x):
+        out = self.net(x)
+        res = x if self.downsample is None else self.downsample(x)
+        return self.relu(out + res)
+
+class TemporalConvNet(nn.Module):
+    def __init__(self, num_inputs, num_channels, kernel_size=2, dropout=0.2):
+        super(TemporalConvNet, self).__init__()
+
+        layers = []
+        num_levels = len(num_channels)
+        for i in range(num_levels):
+            dilation_size = 2 ** i
+            in_channels = num_inputs if i == 0 else num_channels[i-1]
+            out_channels = num_channels[i]
+            layers += [TemporalBlock(in_channels, out_channels, kernel_size, stride = 1, dilation = dilation_size,
+                                     padding = (kernel_size-1) * dilation_size, dropout = dropout)]
+ 
+        self.network = nn.Sequential(*layers)
+ 
+    def forward(self, x):
+        # x (batch_size, in_channel, length)
+        return self.network(x)
+
+
 class NNModel(torch.nn.Module):
-    def __init__(self, onum, hidden_size = 24):
+    def __init__(self, onum, hidden_size = 36):
         super(NNModel, self).__init__()
         
         self.arima_len = onum
         self.length = 60 # recently used dates / 61
+        self.tcn = TemporalConvNet(5, [5, 5]).double()
+
+        self.fc_between_tcn_lstm = nn.Linear(901, self.length).double()
 
         self.lstm = nn.LSTM(
                             input_size = Index_number,
@@ -127,17 +196,22 @@ class NNModel(torch.nn.Module):
         self.final_fc = nn.Linear(2 * Index_number, Index_number).double()
 
     def forward(self, input_seq, arima_data):
-        # input_seq -> (batch_size, length - 1, Index_number)
-        # arima_data -> (batch_size, freq, Index_number)
-        lstm_out, _ = self.lstm(input_seq[:, -self.length:]) # only used recently 120 days data
+        # input_seq -> (batch_size, length - 1 = 901, Index_number)
+        # arima_data -> (batch_size, orn, Index_number)
+        tcn_out = self.tcn(torch.permute(input_seq, (0, 2, 1)))
+        # tcn_out -> (batch_size, Index_number, length - 1)
+        first_fc_out = nn.Sigmoid()(self.fc_between_tcn_lstm(tcn_out))
+        # first_fc_out -> (batch_size, Index_number, self.length)
+
+        lstm_out, _ = self.lstm(torch.permute(first_fc_out, (0, 2, 1))) # only used recently 120 days data
         # lstm_out -> (batch_size, length - 1, hidden_size)
         final_hidden_state = lstm_out[:, -1]
         # final_hidden_state -> (batch_size, hidden_size)
-        output_lstm = self.fc(final_hidden_state)
+        output_lstm = nn.Tanh()(self.fc(final_hidden_state))
         # output_lstm -> (batch_size, Index_number)
         return output_lstm
 
-        output_arima = self.arima_fc(arima_data.reshape(arima_data.shape[0], -1))
+        output_arima = nn.Tanh()(self.arima_fc(arima_data.reshape(arima_data.shape[0], -1)))
         # output_arima -> (batch_size, Index_number)
         # return output_arima
 
@@ -196,7 +270,7 @@ class GlobalModel(object):
         self.best_metric = 0   
 
         # hyper_parameters for NN training
-        self.lr = 3 * 1e-4
+        self.lr = 1e-3
         self.wd = 0.2
         self.batch_size = 16
         self.epochs = 20
@@ -248,7 +322,7 @@ class GlobalModel(object):
             # print(true_y[10:20])
 
 
-    def train(self, data, train_index, dev_index, device = "cpu"):
+    def train(self, data, xgb_data, train_index, dev_index, device = "cpu"):
         self.nn_model.to_device(device)
         self.best_nn_model.to_device(device)
         self.nn_model.train()
@@ -334,7 +408,7 @@ class GlobalModel(object):
         print(self.best_nn_model)
         # print(self.best_nn_model.state_dict())
 
-    def test(self, data, test_index, device = "cpu"):
+    def test(self, data, xgb_data, test_index, device = "cpu"):
         self.best_nn_model.to(device)
         self.best_nn_model.eval()
 
