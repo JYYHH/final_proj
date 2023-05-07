@@ -16,7 +16,8 @@ def trans(raw_data, length = 931, interval = 1, after = 30): # 931
                     sum_up(raw_data[i + mod : i + length - after], interval), 
                     np.sum(raw_data[i + length - after : i + length], axis = 0, keepdims = True)
                 )) 
-                for i in range(Dim0)]
+                    for i in range(Dim0)
+            ]
         ).transpose(0, 2, 1) # `interval` days interval and `after` days prediction
     # shape -> (data_length, Index_number, new_length_with_last_postion_label)
 

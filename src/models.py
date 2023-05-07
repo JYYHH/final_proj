@@ -7,8 +7,7 @@ from xgboost import XGBRegressor
 from torch.nn.utils import weight_norm
 import torch.nn.functional as F
 
-Index_set = torch.tensor([0, 1, 2, 3, 4])
-Index_number = Index_set.shape[0]
+Print_XGboost = 0
 
 class MyARIMA(object):
     # input : (batch_size, index(_quantity), (train_length =) length - 1)
@@ -157,19 +156,20 @@ class TemporalConvNet(nn.Module):
         # x (batch_size, in_channel, length)
         return self.network(x)
 
-
 class NNModel(torch.nn.Module):
-    def __init__(self, onum, hidden_size = 36):
+    def __init__(self, onum, TYPE = "all", hidden_size = 36, index_number = 5):
         super(NNModel, self).__init__()
         
         self.arima_len = onum
         self.length = 60 # recently used dates / 60
         self.tcn = TemporalConvNet(5, [5, 5]).double()
+        self.TYPE = TYPE
+        self.Index_number = index_number
 
         self.fc_between_tcn_lstm = nn.Linear(901, self.length).double()
 
         self.lstm = nn.LSTM(
-                            input_size = Index_number,
+                            input_size = self.Index_number,
                             hidden_size = hidden_size, 
                             num_layers = 2, 
                             batch_first = True,
@@ -183,7 +183,7 @@ class NNModel(torch.nn.Module):
                     nn.Dropout(p = 0.3),
                     # nn.Linear(hidden_size, 20),
                     # nn.LeakyReLU(),
-                    nn.Linear(hidden_size, Index_number)
+                    nn.Linear(hidden_size, self.Index_number)
                     # nn.Sigmoid() # 做分类预测，1升/0降
                     # nn.LeakyReLU(),
                     # nn.Linear(200, 100),
@@ -194,11 +194,11 @@ class NNModel(torch.nn.Module):
                  ).double()
 
         self.arima_fc = nn.Sequential(
-            nn.Linear(self.arima_len * Index_number, self.arima_len * Index_number),
+            nn.Linear(self.arima_len * self.Index_number, self.arima_len * self.Index_number),
             nn.Tanh(),
-            nn.Linear(self.arima_len * Index_number, Index_number),
+            nn.Linear(self.arima_len * self.Index_number, self.Index_number),
         ).double()
-        self.final_fc = nn.Linear(3 * Index_number, Index_number).double()
+        self.final_fc = nn.Linear(3 * self.Index_number, self.Index_number).double()
 
     def forward(self, input_seq, arima_data, xgboost_pred):
         # input_seq -> (batch_size, length - 1 = 901, Index_number)
@@ -209,10 +209,12 @@ class NNModel(torch.nn.Module):
         # first_fc_out -> (batch_size, Index_number, self.length)
 
         lstm_out, _ = self.lstm(torch.permute(first_fc_out, (0, 2, 1))) # only used recently 120 days data
-        # lstm_out -> (batch_size, length - 1, hidden_size)
+        
+        # lstm_out, _ = self.lstm(input_seq[:, -self.length:])
+        # lstm_out -> (batch_size, self.length, hidden_size)
         final_hidden_state = lstm_out[:, -1]
         # final_hidden_state -> (batch_size, hidden_size)
-        output_lstm = nn.ReLU()(self.fc(final_hidden_state))
+        output_lstm = self.fc(final_hidden_state)
         # output_lstm -> (batch_size, Index_number)
         # return output_lstm
 
@@ -222,7 +224,19 @@ class NNModel(torch.nn.Module):
 
         output = self.final_fc(torch.cat((output_lstm, output_arima, xgboost_pred), 1))
         # output -> (batch_size, Index_number)
-        return output
+
+        if self.TYPE == "all":
+            return output
+        elif self.TYPE == "lstm":
+            return output_lstm
+        elif self.TYPE == "arima":
+            return output_arima
+        elif self.TYPE == "xgboost":
+            return xgboost_pred
+        else:
+            print("Wrong TYPE of Model")
+            exit(9)
+
 
     def to_device(self, device):
         self.to(device)
@@ -231,9 +245,13 @@ class GlobalModel(object):
     # input : (data_enrty_number, index(_quantity), length)
     # mid_input : (batch_size, freq_length(12), fit_length(30), index) / (batch_size, index)
 
-    def __init__(self):
+    def __init__(self, TYPE = "all", index_set = [0, 1, 2, 3, 4]):
         self.cpu = "cpu"
         self.gpu = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        self.TYPE = TYPE
+
+        self.Index_set = torch.tensor(index_set)
+        self.Index_number = self.Index_set.shape[0]
 
         # models
         self.arima_model = MyARIMA()
@@ -270,16 +288,10 @@ class GlobalModel(object):
                             )
                    ]
         
-        self.nn_model = NNModel(self.arima_model.onum) 
-        self.best_nn_model = NNModel(self.arima_model.onum)  
+        self.nn_model = NNModel(self.arima_model.onum, self.TYPE, self.Index_number) 
+        self.best_nn_model = NNModel(self.arima_model.onum, self.TYPE, self.Index_number)  
         self.best_metric = 0   
-
-        # hyper_parameters for NN training
-        self.lr = 1e-3
-        self.wd = 0.2
-        self.batch_size = 16
-        self.epochs = 20
-        self.optimizer_type = "adam"
+        
 
     def get_model_params(self):
         return self.nn_model.cpu().state_dict()
@@ -301,7 +313,7 @@ class GlobalModel(object):
         # pre_move to GPU && some transforming
         for batch_idx, (sel, x, arima_x, values) in enumerate(data):
             data[batch_idx] = (torch.tensor(sel).to(device), torch.tensor(x).to(device), torch.tensor(arima_x).to(device), torch.tensor(values).to(device))
-        Index_set.to(device)
+        self.Index_set.to(device)
 
     def xgb_train(self, train_data, dev_data):
         train_data = train_data.transpose(0, 2, 1)
@@ -310,25 +322,11 @@ class GlobalModel(object):
             now_xgb = self.xgb[which_index]
             now_xgb.fit(train_data[:, :-1, which_index], train_data[:, -1, which_index], 
                 eval_set = [(dev_data[:, :-1, which_index], dev_data[:, -1, which_index])], verbose=False)
-            
-            # # prediction on dev_dataset         
-            # predictions = now_xgb.predict(dev_data[:, :-1, which_index])
-            # true_y = dev_data[:, -1, which_index]
-            # acc = np.sum(predictions * true_y > 0) / predictions.shape[0]
-            # print(f"XGBoost 's acc on dev_set = {acc}")
-            
-            # # prediction on train_dataset
-            # predictions = now_xgb.predict(train_data[:, :-1, which_index])
-            # true_y = train_data[:, -1, which_index]
-            # acc = np.sum(predictions * true_y > 0) / predictions.shape[0]
-            # print(f"XGBoost 's acc on train_set = {acc}")
-            # print(predictions[10:20])
-            # print(true_y[10:20])
 
     def xgb_test(self, test_data):
         right, tot = 0, 0
         test_data = test_data.transpose(0, 2, 1)
-        for which_index in Index_set:
+        for which_index in self.Index_set:
             now_xgb = self.xgb[which_index]
             predictions = now_xgb.predict(test_data[:, :-1, which_index])
             true_y = test_data[:, -1, which_index]
@@ -341,21 +339,26 @@ class GlobalModel(object):
     def xgb_predict(self, infer_data):
         # data -> (batch_size, Index_number, length)
         ret = []
-        for idx, which_index in enumerate(Index_set):
+        for idx, which_index in enumerate(self.Index_set):
             now_xgb = self.xgb[which_index]
             now_data = infer_data[:, idx]
             # print(now_data.shape)
             predictions = now_xgb.predict(now_data)
             ret.append(predictions)
-        # ret -> (batch_size, Index_number)
         ret = np.array(ret, dtype = np.float64).T
+        # ret -> (batch_size, Index_number)
         ret = torch.tensor(ret).to(self.gpu)
         return ret
 
-    def train(self, data, xgb_data, train_index, dev_index, device = "cpu"):
+    def train(self, data, xgb_data, train_index, dev_index, device = "cpu", epochs = 100, learning_rate = 3 * 1e-3, weight_decay = 0.2, batch_size = 16, optimER = "sgd"):
         self.nn_model.to_device(device)
         self.best_nn_model.to_device(device)
         self.nn_model.train()
+        self.epochs = epochs
+        self.lr = learning_rate
+        self.wd = weight_decay
+        self.batch_size = batch_size
+        self.optimizer_type = optimER
         train_data_raw, dev_data_raw = data[train_index], data[dev_index]
 
         self.xgb_train(xgb_data[train_index], xgb_data[dev_index])
@@ -386,7 +389,7 @@ class GlobalModel(object):
 
         begin_time = time.time()
 
-        epoch_loss = []
+        self.train_epoch_loss, self.dev_epoch_loss = [], []
         for epoch in range(self.epochs):
             # transform the data -------> now combine the output of ARIMA Models
             train_data = self.ret_batch_data(train_data_raw, self.arima_model.get_ret_from_file(train_index))
@@ -397,49 +400,56 @@ class GlobalModel(object):
             
             batch_loss, tot_sample = [], 0
             for batch_idx, (sel, x, arima_x, values) in enumerate(train_data):
-                # x, values = x.to(device), values.to(device)
                 self.nn_model.zero_grad()
                 Pred = self.nn_model(
-                    x[:, :, Index_set], 
-                    arima_x[:, :, Index_set], 
+                    x[:, :, self.Index_set], 
+                    arima_x[:, :, self.Index_set], 
                     self.xgb_predict(
-                        xgb_data[train_index][sel.cpu().numpy()][:, Index_set, :-1]
+                        xgb_data[train_index][sel.cpu().numpy()][:, self.Index_set, :-1]
                     )
                 ).reshape(-1)
-                # print(Pred.shape, values.reshape(x.shape[0], -1)[:, Index_set].reshape(-1).shape)
-                loss = criterion(Pred, values.reshape(x.shape[0], -1)[:, Index_set].reshape(-1)) * x.shape[0]
-                loss.backward()
-
+                loss = criterion(Pred, values.reshape(x.shape[0], -1)[:, self.Index_set].reshape(-1)) * x.shape[0]
+                try:
+                    loss.backward()
+                except:
+                    global Print_XGboost
+                    Print_XGboost += 1
+                    if Print_XGboost == 1:
+                        print("Now it's Xgboost, and do not need to Back Propagation")
                 optimizer.step()
-                batch_loss.append(loss.item() * x.shape[0])
-                tot_sample += x.shape[0]
+                batch_loss.append(loss.item() * self.Index_number)
+                tot_sample += x.shape[0] * self.Index_number
 
-            epoch_loss.append(sum(batch_loss) / tot_sample)
-            print('Epoch: {} \nAverage data point Loss(MSE): {:.6f}'.format(epoch, epoch_loss[-1]))
+            self.train_epoch_loss.append(sum(batch_loss) / tot_sample)
+            print('(Training) Epoch: {} Average data point Loss(MSE): {:.6f}'.format(epoch, self.train_epoch_loss[-1]))
 
             # use the dev-data-set to test the model in independent dataset
+            batch_loss, tot_sample = [], 0
             with torch.no_grad():
                 tot, right = 0, 0
                 for batch_idx, (sel, x, arima_x, values) in enumerate(dev_data):
-                    # x, values = x.to(device), values.to(device)
                     pred = self.nn_model(
-                        x[:, :, Index_set], 
-                        arima_x[:, :, Index_set], 
+                        x[:, :, self.Index_set], 
+                        arima_x[:, :, self.Index_set], 
                         self.xgb_predict(
-                            xgb_data[dev_index][sel.cpu().numpy()][:, Index_set, :-1]
+                            xgb_data[dev_index][sel.cpu().numpy()][:, self.Index_set, :-1]
                         )
                     ).reshape(-1)
-                    loss = criterion(pred, values.reshape(x.shape[0], -1)[:, Index_set].reshape(-1)) * x.shape[0]
+                    loss = criterion(pred, values.reshape(x.shape[0], -1)[:, self.Index_set].reshape(-1)) * x.shape[0]
+                    batch_loss.append(loss.item() * self.Index_number)
+                    tot_sample += x.shape[0] * self.Index_number
 
-                    # _, predicted = torch.max(pred, -1)
-                    tot += x.shape[0] * Index_number
-                    right += torch.sum((pred * values.reshape(x.shape[0], -1)[:, Index_set].reshape(-1)) > 0)
+                    tot += x.shape[0] * self.Index_number
+                    right += torch.sum((pred * values.reshape(x.shape[0], -1)[:, self.Index_set].reshape(-1)) > 0)
 
-                    if batch_idx <= 2:
-                        # print(x[:3, :, Index_set].reshape(3, -1))
-                        print(pred[:3], values.reshape(x.shape[0], -1)[:, Index_set].reshape(-1)[:3], end = '\n')
+                    # if batch_idx <= 2:
+                    #     # print(x[:3, :, Index_set].reshape(3, -1))
+                    #     print(pred[:3], values.reshape(x.shape[0], -1)[:, Index_set].reshape(-1)[:3], end = '\n')
                 acc = right/tot
-                print('ACC in dev dataset: {:.6f}'.format(acc))
+                # print('ACC in dev dataset: {:.6f}'.format(acc))
+
+                self.dev_epoch_loss.append(sum(batch_loss) / tot_sample)
+                print('(Dev Dataset) Epoch: {} Average data point Loss(MSE): {:.6f}'.format(epoch, self.dev_epoch_loss[-1]))
 
                 # only save the best model !
                 if acc >= self.best_metric :
@@ -447,10 +457,10 @@ class GlobalModel(object):
                     self.best_nn_model.load_state_dict(self.nn_model.state_dict())
         
         print(f'total time = {time.time() - begin_time} s')
-        print(f'Best acc in valid set : {self.best_metric}')
 
-        print(self.best_nn_model)
-        # print(self.best_nn_model.state_dict())
+        # print(self.best_nn_model)
+
+        return self.best_metric, self.train_epoch_loss, self.dev_epoch_loss
 
     def test(self, data, xgb_data, test_index, device = "cpu"):
         self.best_nn_model.to(device)
@@ -461,9 +471,18 @@ class GlobalModel(object):
         test_data = data[test_index]
 
         metrics = {
-            'total_loss': 0.0,
-            'right_number': 0,
-            'test_total': 0
+            # 'total_loss': 0.0,
+            'TP': 0,
+            'TN': 0,
+            'FP': 0,
+            'FN': 0,
+            'acc': 0.0,
+            'prec_1': 0.0,
+            'recall_1': 0.0,
+            'f1-score_1': 0.0,
+            'prec_0': 0.0,
+            'recall_0': 0.0,
+            'f1-score_0': 0.0,
         }
 
         criterion = nn.MSELoss().to(device) # Regression
@@ -477,82 +496,29 @@ class GlobalModel(object):
         with torch.no_grad():
             for batch_idx, (sel, x, arima_x, values) in enumerate(test_data):
                 # NNN = arima_x
-                pred = self.nn_model(
-                    x[:, :, Index_set], 
-                    arima_x[:, :, Index_set], 
+                pred = self.best_nn_model(
+                    x[:, :, self.Index_set], 
+                    arima_x[:, :, self.Index_set], 
                     self.xgb_predict(
-                        xgb_data[test_index][sel.cpu().numpy()][:, Index_set, :-1]
+                        xgb_data[test_index][sel.cpu().numpy()][:, self.Index_set, :-1]
                     )
                 ).reshape(-1)
                 # print(pred.shape, values.reshape(x.shape[0], -1)[:, Index_set].reshape(-1).shape)
-                loss = criterion(pred, values.reshape(x.shape[0], -1)[:, Index_set].reshape(-1)) * x.shape[0]
+                loss = criterion(pred, values.reshape(x.shape[0], -1)[:, self.Index_set].reshape(-1)) * x.shape[0]
+                true_value = values.reshape(x.shape[0], -1)[:, self.Index_set].reshape(-1)
 
-                metrics['total_loss'] += loss.item() * x.shape[0]
-                metrics['test_total'] += x.shape[0] * Index_number
-                metrics['right_number'] += torch.sum((pred * values.reshape(x.shape[0], -1)[:, Index_set].reshape(-1)) > 0)
+                # metrics['total_loss'] += loss.item() * self.Index_number
+                metrics['TP'] += torch.sum((pred > 0) & (true_value > 0)).detach().cpu().numpy()
+                metrics['TN'] += torch.sum((pred < 0) & (true_value < 0)).detach().cpu().numpy()
+                metrics['FP'] += torch.sum((pred > 0) & (true_value < 0)).detach().cpu().numpy()
+                metrics['FN'] += torch.sum((pred < 0) & (true_value > 0)).detach().cpu().numpy()
 
-        print('ACC = {}'.format(metrics['right_number'] / metrics['test_total']))
 
-        # x = torch.normal(0, 1, (3, 61, 1)).to(self.gpu).double()
-        # print(x[0], x[1], x[2])
-        # print(self.best_nn_model(x[:1], NNN))
-        # print(self.best_nn_model(x[1:2], NNN))
-        # print(self.best_nn_model(x[2:3], NNN))
-        # print(self.best_nn_model(test_data[0][0][:, :, Index_set], test_data[0][1][:, :, Index_set]))
-        # print(self.best_nn_model(test_data[1][0][:, :, Index_set], test_data[1][1][:, :, Index_set]))
-
+        metrics['acc'] = (metrics['TN'] + metrics['TP']) / (metrics['TN'] + metrics['TP'] + metrics['FN'] + metrics['FP'])
+        metrics['prec_1'] = metrics['TP'] / (metrics['TP'] + metrics['FP'])
+        metrics['recall_1'] = metrics['TP'] / (metrics['TP'] + metrics['FN'])
+        metrics['f1-score_1'] = 2.0 / (1.0/metrics['prec_1'] + 1.0/metrics['recall_1'])
+        metrics['prec_0'] = metrics['TN'] / (metrics['TN'] + metrics['FN'])
+        metrics['recall_0'] = metrics['TN'] / (metrics['TN'] + metrics['FP'])
+        metrics['f1-score_0'] = 2.0 / (1.0/metrics['prec_0'] + 1.0/metrics['recall_0'])
         return metrics
-
-
-
-
-
-
-
-########################################################################################################
-    # __init__
-        # self.lstms = [ nn.LSTM(
-        #                     input_size = 5,
-        #                     hidden_size = hidden_size, 
-        #                     num_layers=2, 
-        #                     batch_first=True
-        #                 ).double() # into float64
-        #               for i in range(freq)
-        #             ]   
-
-        # self.fcs = [ nn.Linear(hidden_size, 5).double() for i in range(freq) ] # into float64
-
-        # self.last_MLP = nn.Sequential(
-        #                     nn.Tanh(),
-        #                     # nn.Linear(5 * self.freq, hidden_size * 5),
-        #                     # nn.ReLU(),
-        #                     # nn.Linear(hidden_size * 5, hidden_size),
-        #                     # nn.ReLU(),
-        #                     # nn.Linear(hidden_size, 5)
-        #                     nn.Linear(5 * self.freq, 5)
-        #                 ).double() # into float64
-
-    # forward
-        # # # input_seq -> (batch_size, freq_length(12), fit_length(30), 5)
-        # mid = [ self.fcs[i](self.lstms[i](input_seq[:, i])[0][:, -1]).reshape(1, -1, 5) for i in range(self.freq) ]
-        # # mid = [(1, batch_size, 5) * freq ]'s list
-        # mid2 = torch.permute(torch.cat(mid, 0), (1, 0, 2))
-        # # mid2 = (batch_size, freq, 5)
-        # output = self.last_MLP(mid2.reshape(mid2.shape[0], -1))
-        # # output = (batch_size, 5)
-        # return output
-
-    # to_device
-        # for lstm in self.lstms:
-        #     lstm.to(device)
-        # for fc in self.fcs:
-        #     fc.to(device)
-        # self.last_MLP.to(device)
-
-    # preprocessing
-            # # x : (batch_size, length-1, 5)
-            # x = torch.tensor(np.array([ x[:, -f::-f][:, :self.arima_model.fit_length][:, -1::-1] for f in self.arima_model.freq ])).double()
-            # # x : (freq, batch, fit_length, 5)
-            # x = torch.permute(x, (1, 0, 2, 3))
-            # # x : (batch, freq, fit_length, 5)
-            # data[batch_idx] = (x.to(device), torch.tensor(values).to(device))
