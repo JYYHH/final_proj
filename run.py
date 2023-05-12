@@ -25,7 +25,8 @@ _, train_loss_list, dev_loss_list = model.train(
         dev_index = np.arange(1000, 1300), 
         device = model.gpu,
         epochs = 100,
-        learning_rate = 3 * 1e-3
+        learning_rate = 1 * 1e-3,
+        loss_func = "MSE"
     )
 train_dataset_metrics = model.test(ALL, part, np.arange(1000), model.gpu)
 test_dataset_metrics = model.test(ALL, part, np.arange(1000, 1300), model.gpu)

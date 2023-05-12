@@ -201,15 +201,28 @@ class NNModel(torch.nn.Module):
         self.final_fc = nn.Linear(3 * self.Index_number, self.Index_number).double()
 
     def forward(self, input_seq, arima_data, xgboost_pred):
-        # input_seq -> (batch_size, length - 1 = 901, Index_number)
+        # input_seq -> (batch_size, length = 901, Index_number)
         # arima_data -> (batch_size, orn, Index_number)
         tcn_out = self.tcn(torch.permute(input_seq, (0, 2, 1)))
-        # tcn_out -> (batch_size, Index_number, length - 1)
-        first_fc_out = nn.Sigmoid()(self.fc_between_tcn_lstm(tcn_out))
+        # tcn_out -> (batch_size, Index_number, length = 901)
+        # first_fc_out = nn.Sigmoid()(self.fc_between_tcn_lstm(tcn_out)) # fc
         # first_fc_out -> (batch_size, Index_number, self.length)
 
-        lstm_out, _ = self.lstm(torch.permute(first_fc_out, (0, 2, 1))) # only used recently 120 days data
-        
+        if self.type == "all":
+            # transfer to 15 days interval
+            tcn_out = tcn_out[:, :, 1:]
+            sum_up_ = tcn_out.reshape(tcn_out.shape[0], tcn_out.shape[1], -1, 15)
+            sum_up_ = sum_up_.sum(axis = 3, keepdims = False)
+                # sum_up_ -> (batch_size, Index_number, self.length)
+
+            lstm_out, _ = self.lstm(torch.permute(sum_up_, (0, 2, 1))) # only used recently 120 days data
+        elif self.type == "delete_fc":
+            lstm_out, _ = self.lstm(torch.permute(tcn_out[:, :, -self.length:], (0, 2, 1)))
+        else:
+            first_fc_out = nn.Sigmoid()(self.fc_between_tcn_lstm(tcn_out)) # fc
+            lstm_out, _ = self.lstm(torch.permute(first_fc_out, (0, 2, 1)))
+
+
         # lstm_out, _ = self.lstm(input_seq[:, -self.length:])
         # lstm_out -> (batch_size, self.length, hidden_size)
         final_hidden_state = lstm_out[:, -1]
@@ -225,7 +238,7 @@ class NNModel(torch.nn.Module):
         output = self.final_fc(torch.cat((output_lstm, output_arima, xgboost_pred), 1))
         # output -> (batch_size, Index_number)
 
-        if self.TYPE == "all":
+        if self.TYPE == "all" or self.TYPE == "origin" or self.TYPE == "delete_fc":
             return output
         elif self.TYPE == "lstm":
             return output_lstm
@@ -246,6 +259,17 @@ class GlobalModel(object):
     # mid_input : (batch_size, freq_length(12), fit_length(30), index) / (batch_size, index)
 
     def __init__(self, TYPE = "all", index_set = [0, 1, 2, 3, 4]):
+        """
+            TYPE:
+                all -> final global integrated model
+                xgboost -> only xgboost way
+                arima -> only arima way
+                origin -> model on 5.9's pre
+                delete_fc -> 取后60个TCN项
+                lstm -> only DNN way
+        """
+
+
         self.cpu = "cpu"
         self.gpu = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         self.TYPE = TYPE
@@ -350,7 +374,7 @@ class GlobalModel(object):
         ret = torch.tensor(ret).to(self.gpu)
         return ret
 
-    def train(self, data, xgb_data, train_index, dev_index, device = "cpu", epochs = 100, learning_rate = 3 * 1e-3, weight_decay = 0.2, batch_size = 16, optimER = "sgd"):
+    def train(self, data, xgb_data, train_index, dev_index, device = "cpu", epochs = 100, learning_rate = 3 * 1e-3, loss_func = "MSE", weight_decay = 0.2, batch_size = 16, optimER = "sgd"):
         self.nn_model.to_device(device)
         self.best_nn_model.to_device(device)
         self.nn_model.train()
@@ -366,8 +390,10 @@ class GlobalModel(object):
         # exit(0)
 
         # train and update
-        criterion = nn.MSELoss().to(device) # Regression
-        # criterion = nn.BCELoss().to(device) # Classification
+        if loss_func == "MSE":
+            criterion = nn.MSELoss().to(device) # Regression
+        else:
+            criterion = nn.BCELoss().to(device) # Classification
 
         if self.optimizer_type == "sgd":
             optimizer = torch.optim.SGD(
@@ -408,7 +434,10 @@ class GlobalModel(object):
                         xgb_data[train_index][sel.cpu().numpy()][:, self.Index_set, :-1]
                     )
                 ).reshape(-1)
-                loss = criterion(Pred, values.reshape(x.shape[0], -1)[:, self.Index_set].reshape(-1)) * x.shape[0]
+                if loss_func == "MSE":
+                    loss = criterion(Pred, values.reshape(x.shape[0], -1)[:, self.Index_set].reshape(-1)) * x.shape[0]
+                else:
+                    loss = criterion(nn.Sigmoid()(Pred), (values.reshape(x.shape[0], -1)[:, self.Index_set].reshape(-1) > 0).double()) * x.shape[0]
                 try:
                     loss.backward()
                 except:
@@ -435,7 +464,11 @@ class GlobalModel(object):
                             xgb_data[dev_index][sel.cpu().numpy()][:, self.Index_set, :-1]
                         )
                     ).reshape(-1)
-                    loss = criterion(pred, values.reshape(x.shape[0], -1)[:, self.Index_set].reshape(-1)) * x.shape[0]
+                    if loss_func == "MSE":
+                        loss = criterion(pred, values.reshape(x.shape[0], -1)[:, self.Index_set].reshape(-1)) * x.shape[0]
+                    else:
+                        loss = criterion(nn.Sigmoid()(pred), (values.reshape(x.shape[0], -1)[:, self.Index_set].reshape(-1) > 0).double()) * x.shape[0]
+                    
                     batch_loss.append(loss.item() * self.Index_number)
                     tot_sample += x.shape[0] * self.Index_number
 
@@ -485,7 +518,7 @@ class GlobalModel(object):
             'f1-score_0': 0.0,
         }
 
-        criterion = nn.MSELoss().to(device) # Regression
+        # criterion = nn.MSELoss().to(device) # Regression
         # criterion = nn.BCELoss().to(device) # Classification
         # transform the data
         test_data = self.ret_batch_data(test_data, self.arima_model.get_ret_from_file(test_index))
@@ -504,7 +537,7 @@ class GlobalModel(object):
                     )
                 ).reshape(-1)
                 # print(pred.shape, values.reshape(x.shape[0], -1)[:, Index_set].reshape(-1).shape)
-                loss = criterion(pred, values.reshape(x.shape[0], -1)[:, self.Index_set].reshape(-1)) * x.shape[0]
+                # loss = criterion(pred, values.reshape(x.shape[0], -1)[:, self.Index_set].reshape(-1)) * x.shape[0]
                 true_value = values.reshape(x.shape[0], -1)[:, self.Index_set].reshape(-1)
 
                 # metrics['total_loss'] += loss.item() * self.Index_number
@@ -517,8 +550,8 @@ class GlobalModel(object):
         metrics['acc'] = (metrics['TN'] + metrics['TP']) / (metrics['TN'] + metrics['TP'] + metrics['FN'] + metrics['FP'])
         metrics['prec_1'] = metrics['TP'] / (metrics['TP'] + metrics['FP'])
         metrics['recall_1'] = metrics['TP'] / (metrics['TP'] + metrics['FN'])
-        metrics['f1-score_1'] = 2.0 / (1.0/metrics['prec_1'] + 1.0/metrics['recall_1'])
+        metrics['f1-score_1'] = 2.0 / (1.0 / metrics['prec_1'] + 1.0 / metrics['recall_1'])
         metrics['prec_0'] = metrics['TN'] / (metrics['TN'] + metrics['FN'])
         metrics['recall_0'] = metrics['TN'] / (metrics['TN'] + metrics['FP'])
-        metrics['f1-score_0'] = 2.0 / (1.0/metrics['prec_0'] + 1.0/metrics['recall_0'])
+        metrics['f1-score_0'] = 2.0 / (1.0 / metrics['prec_0'] + 1.0 / metrics['recall_0'])
         return metrics
