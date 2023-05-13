@@ -7,3 +7,5 @@
     1. the x-axis and y-axis should swap
     2. in each axis, 0 and 1 should swap, too
 
+## More..
+- Some properties are added into the source code but not put onto `show.ipynb`, for some reasons.

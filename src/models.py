@@ -157,12 +157,12 @@ class TemporalConvNet(nn.Module):
         return self.network(x)
 
 class NNModel(torch.nn.Module):
-    def __init__(self, onum, TYPE = "all", hidden_size = 36, index_number = 5):
+    def __init__(self, onum, TYPE = "all", index_number = 5, hidden_size = 36):
         super(NNModel, self).__init__()
         
         self.arima_len = onum
         self.length = 60 # recently used dates / 60
-        self.tcn = TemporalConvNet(5, [5, 5]).double()
+        self.tcn = TemporalConvNet(index_number, [index_number, index_number]).double()
         self.TYPE = TYPE
         self.Index_number = index_number
 
@@ -272,10 +272,11 @@ class GlobalModel(object):
 
         self.cpu = "cpu"
         self.gpu = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        self.more_gpu = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
         self.TYPE = TYPE
 
-        self.Index_set = torch.tensor(index_set)
-        self.Index_number = self.Index_set.shape[0]
+        self.Index_set = index_set
+        self.Index_number = len(index_set)
 
         # models
         self.arima_model = MyARIMA()
@@ -337,15 +338,15 @@ class GlobalModel(object):
         # pre_move to GPU && some transforming
         for batch_idx, (sel, x, arima_x, values) in enumerate(data):
             data[batch_idx] = (torch.tensor(sel).to(device), torch.tensor(x).to(device), torch.tensor(arima_x).to(device), torch.tensor(values).to(device))
-        self.Index_set.to(device)
+        # self.Index_set.to(device)
 
     def xgb_train(self, train_data, dev_data):
         train_data = train_data.transpose(0, 2, 1)
         dev_data = dev_data.transpose(0, 2, 1)
-        for which_index in range(5):
+        for idx, which_index in enumerate(self.Index_set):
             now_xgb = self.xgb[which_index]
-            now_xgb.fit(train_data[:, :-1, which_index], train_data[:, -1, which_index], 
-                eval_set = [(dev_data[:, :-1, which_index], dev_data[:, -1, which_index])], verbose=False)
+            now_xgb.fit(train_data[:, :-1, idx], train_data[:, -1, idx], 
+                eval_set = [(dev_data[:, :-1, idx], dev_data[:, -1, idx])], verbose=False)
 
     def xgb_test(self, test_data):
         right, tot = 0, 0
@@ -360,7 +361,7 @@ class GlobalModel(object):
         
         print(f"XGB test : Acc on test data is {right / tot}")
 
-    def xgb_predict(self, infer_data):
+    def xgb_predict(self, infer_data, device):
         # data -> (batch_size, Index_number, length)
         ret = []
         for idx, which_index in enumerate(self.Index_set):
@@ -371,7 +372,7 @@ class GlobalModel(object):
             ret.append(predictions)
         ret = np.array(ret, dtype = np.float64).T
         # ret -> (batch_size, Index_number)
-        ret = torch.tensor(ret).to(self.gpu)
+        ret = torch.tensor(ret).to(device)
         return ret
 
     def train(self, data, xgb_data, train_index, dev_index, device = "cpu", epochs = 100, learning_rate = 3 * 1e-3, loss_func = "MSE", weight_decay = 0.2, batch_size = 16, optimER = "sgd"):
@@ -385,7 +386,7 @@ class GlobalModel(object):
         self.optimizer_type = optimER
         train_data_raw, dev_data_raw = data[train_index], data[dev_index]
 
-        self.xgb_train(xgb_data[train_index], xgb_data[dev_index])
+        self.xgb_train(xgb_data[train_index][:, self.Index_set], xgb_data[dev_index][:, self.Index_set])
         # self.xgb_test(xgb_data[dev_index])
         # exit(0)
 
@@ -431,7 +432,8 @@ class GlobalModel(object):
                     x[:, :, self.Index_set], 
                     arima_x[:, :, self.Index_set], 
                     self.xgb_predict(
-                        xgb_data[train_index][sel.cpu().numpy()][:, self.Index_set, :-1]
+                        xgb_data[train_index][sel.cpu().numpy()][:, self.Index_set, :-1],
+                        device
                     )
                 ).reshape(-1)
                 if loss_func == "MSE":
@@ -461,7 +463,8 @@ class GlobalModel(object):
                         x[:, :, self.Index_set], 
                         arima_x[:, :, self.Index_set], 
                         self.xgb_predict(
-                            xgb_data[dev_index][sel.cpu().numpy()][:, self.Index_set, :-1]
+                            xgb_data[dev_index][sel.cpu().numpy()][:, self.Index_set, :-1],
+                            device
                         )
                     ).reshape(-1)
                     if loss_func == "MSE":
@@ -533,7 +536,8 @@ class GlobalModel(object):
                     x[:, :, self.Index_set], 
                     arima_x[:, :, self.Index_set], 
                     self.xgb_predict(
-                        xgb_data[test_index][sel.cpu().numpy()][:, self.Index_set, :-1]
+                        xgb_data[test_index][sel.cpu().numpy()][:, self.Index_set, :-1],
+                        device
                     )
                 ).reshape(-1)
                 # print(pred.shape, values.reshape(x.shape[0], -1)[:, Index_set].reshape(-1).shape)
